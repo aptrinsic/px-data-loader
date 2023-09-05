@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+#########################################################################################
+# Gainsight PX data loader
+# Loads user or customer data using the Gainsight PX REST api
+# v1.3.5
+# 7/2023
+#########################################################################################
+
+from __future__ import print_function
+import csv
+import sys
+import optparse
+import os.path
+import json
+import dateutil.parser as dparser
+from datetime import datetime
+import pytz
+from distutils.util import strtobool
+import ast
+import os
+import requests
+from requests.packages.urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+
+# If you get an error on the above statement, install the requests library with this command:
+#   pip install requests
+
+DATA_CENTER_TO_BE_MAP = {
+    'US': 'https://api.aptrinsic.com',
+    'EU': 'https://api-eu.aptrinsic.com',
+    'US2': 'https://api-us2.aptrinsic.com',
+    'DEV': 'https://api-dev.aptrinsic.com'
+}
+
+
+DEFAULT_TIMEOUT = 8  # seconds
+USER_TYPE = "USER"
+ACCOUNT_TYPE = "ACCOUNT"
+CUSTOM_EVENT = "CUSTOM_EVENT"
+USER_PREFERENCES = "USER_PREFERENCES"
+VALID_TYPES = [USER_TYPE, ACCOUNT_TYPE, CUSTOM_EVENT, USER_PREFERENCES]
+DATATYPE_DATE = "DATE_TIME"
+DATATYPE_NUMBER = "NUMBER"
+DATATYPE_BOOLEAN = "BOOLEAN"
+EPOCH_START_TIME = datetime(1970, 1, 1, 0, 0, 0, tzinfo=pytz.timezone('UTC'))
+DEFAULT_HEADER = {
+    'content-type': 'application/json',
+    'X-APTRINSIC-API-KEY': None
+}
+INFO_BY_TYPE = {
+    USER_TYPE: {
+        'keyField': 'identifyId',
+        'endpoint': "users",
+        'metadataEndPoint': "user",
+        'fieldNames': [
+            "aptrinsicId",
+            "identifyId",
+            "type",
+            "gender",
+            "email",
+            "firstName",
+            "lastName",
+            "lastSeenDate",
+            "signUpDate",
+            "firstVisitDate",
+            "title",
+            "phone",
+            "score",
+            "role",
+            "subscriptionId",
+            "accountId",
+            "numberOfVisits",
+            "location.city",
+            "location.stateCode",
+            "location.stateName",
+            "location.countryCode",
+            "location.countryName",
+            "location.timeZone",
+            "location.coordinates.latitude",
+            "location.coordinates.longitude",
+            "createDate",
+            "lastModifiedDate",
+            "customAttributes",
+            "globalUnsubscribe",
+            "sfdcContactId"
+        ],
+        "apiNameMapping": {
+            "id": "identifyId"
+        }
+    },
+    ACCOUNT_TYPE: {
+        'keyField': 'id',
+        'endpoint': "accounts",
+        'metadataEndPoint': "account",
+        'fieldNames': [
+            "id",
+            "name",
+            "trackedSubscriptionId",
+            "sfdcId",
+            "lastSeenDate",
+            "dunsNumber",
+            "industry",
+            "numberOfEmployees",
+            "sicCode",
+            "website",
+            "naicsCode",
+            "plan",
+            "location",
+            "createDate",
+            "lastModifiedDate",
+            "customAttributes",
+            "parentGroupId",
+            "location.city",
+            "location.stateCode",
+            "location.stateName",
+            "location.countryCode",
+            "location.countryName",
+            "location.timeZone"
+        ],
+        "apiNameMapping": {}
+    },
+    CUSTOM_EVENT: {
+        'keyField': 'identifyId',
+        'endpoint': "events/custom",
+        'fieldNames': [
+            "identifyId",
+            "eventName",
+            "date",
+            "attributes",
+            "accountId",
+            "url",
+            "referrer",
+            "remoteHost"
+        ],
+        "apiNameMapping": {}
+    },
+    USER_PREFERENCES: {
+        'keyField': 'identifyId',
+        'endpoint': "user/preferences",
+        'fieldNames': [
+            "identifyId",
+            "trackUsage",
+            "productUpdates",
+            "guidedTours",
+            "surveys",
+            "onboardingBot"
+        ],
+        "apiNameMapping": {
+            "id": "identifyId"
+        }
+    }
+}
+
+
+def getBaseURL(config):
+    dataCenter = config.get('dataCenter') or 'US'
+    baseurl = getBEServer(dataCenter)
+    return baseurl + "/v1"
+
+
+def getBEServer(dataCenter):
+    return DATA_CENTER_TO_BE_MAP.get(dataCenter)
+
+
+def loadFieldTypeMapping(datatype, config):
+    headers = getHeaders(config)
+    datatypeMapping = {}
+    if dataType.upper() == CUSTOM_EVENT:
+        # No metadata endpoint for custom events
+        # Return constant for known fields
+        datatypeMapping = {
+            "identifyId": "STRING",
+            "eventName": "STRING",
+            "date": "DATE_TIME",
+            "accountId": "STRING",
+            "url": "STRING",
+            "referrer": "STRING",
+            "remoteHost": "STRING"
+        }
+    elif dataType.upper() == USER_PREFERENCES:
+        # No metadata endpoint for user preferences
+        # Return constant for known fields
+        datatypeMapping = {
+            "id": "STRING",
+            "trackUsage": "BOOLEAN",
+            "productUpdates": "BOOLEAN",
+            "guidedTours": "BOOLEAN",
+            "surveys": "BOOLEAN",
+            "onboardingBot": "BOOLEAN"
+        }
+    else:
+        baseurl = getBaseURL(config)
+        metadataendpoint = baseurl + "/admin/model/" + INFO_BY_TYPE[datatype].get("metadataEndPoint") + "/attributes"
+        response = requestsRetrySession().get(metadataendpoint, headers=headers)
+        if response.status_code == 200:
+            fields = json.loads(response.text)
+            datatypeMapping = dict((fld.get("apiName"), fld.get("type")) for fld in fields)
+            if datatype == USER_TYPE and 'sfdcContactId' not in datatypeMapping:
+                # Manually add sfdcContactId, it is not exposed in the metadata endpoint
+                datatypeMapping['sfdcContactId'] = 'STRING'
+            if datatype == USER_TYPE and 'globalUnsubscribe' not in datatypeMapping:
+                # Manually add globalUnsubscribe, it is not exposed in the metadata endpoint
+                datatypeMapping['globalUnsubscribe'] = 'BOOLEAN'
+        else:
+            if (response.text and "Authentication failed in loginAwareAuthentication" in response.text):
+                raise Exception("Unable to login to PX, validate apiKey: '%s'" % (config.get('apiKey')))
+            else:
+                raise Exception("Error fetching metadata for %s with '%s': '%s'" % (datatype, metadataendpoint, response.text))
+    return datatypeMapping
+
+
+def loadConfig(configFile):
+    print("Loading config from '%s'" % (configFile.name))
+    config = json.load(configFile)
+    return config
+
+
+def writeToErrorFile(errorFile, csvRow, errorResponse):
+    try:
+        errorResponseJSON = json.loads(errorResponse)
+        if errorResponseJSON.get("externalapierror"):
+            errorString = errorResponseJSON["externalapierror"]["subErrors"][0]["message"] if errorResponseJSON.get(
+                "externalapierror") and errorResponseJSON["externalapierror"]["subErrors"] else \
+                errorResponseJSON["externalapierror"]["status"]
+        else:
+            errorString = errorResponseJSON.get('errorMessage')
+    except:
+        errorString = errorResponse
+
+    csvRow["error_text_gs"] = errorString
+
+    ef = open(errorFile, "a+")
+    try:
+        ef.write('"' + ('","'.join(csvRow.values())) + '"\n')
+    except:
+        pass
+    ef.close()
+
+
+def validateConfig(config, dataType, strictMode):
+    # Validate required fields
+    for fieldName in ["apiKey", "productKey", "fieldMapping"]:
+        if not config.get(fieldName):
+            raise Exception("Missing required field '%s' in '%s'" % (fieldName, configFile.name))
+
+    dataCenter = config.get('dataCenter')
+    if dataCenter and not getBEServer(dataCenter):
+        raise Exception("Config has invalid value '%s' for dataCenter. Choices: '%s'" % (dataCenter, ",".join(DATA_CENTER_TO_BE_MAP.keys())))
+
+    fieldMapping = config.get('fieldMapping')
+    if not isinstance(fieldMapping, dict) or not fieldMapping.get(dataType) or not isinstance(fieldMapping.get(dataType),
+                                                                                              dict):
+        raise Exception("Invalid fieldMapping value '%s' in '%s'. Must be an object with an entry for %s" % (
+            config.get('fieldMapping'), configFile.name, dataType))
+
+    dataTypeFieldMapping = fieldMapping.get(dataType)
+    if len(dataTypeFieldMapping.items()) < 2:
+        raise Exception("Invalid fieldMapping value '%s' in '%s'. Must be an object with at least two entries" % (
+            dataTypeFieldMapping, configFile.name))
+
+    keyField = INFO_BY_TYPE[dataType].get('keyField')
+    if keyField not in dataTypeFieldMapping.keys():
+        raise Exception("Invalid fieldMapping value '%s' in '%s'. Missing required key field '%s'" % (
+            dataTypeFieldMapping, configFile.name, keyField))
+
+    # Validate non-key fields
+    for fieldName in dataTypeFieldMapping.keys():
+        if fieldName not in INFO_BY_TYPE[dataType].get('fieldNames') and not (
+            fieldName.startswith("customAttributes.") or fieldName.startswith("attributes.")):
+            raise Exception("Unknown field '%s' in fieldMapping in '%s'.  Valid Values: '%s'" %
+                            (fieldName, configFile.name, INFO_BY_TYPE[dataType].get('fieldNames')))
+
+    # Validate optional timezone, default to UTC
+    importDatetimezoneStr = config.get("timezone")
+    if importDatetimezoneStr and importDatetimezoneStr not in pytz.all_timezones:
+        raise Exception("Unknown timezone value '%s' in '%s'.  Valid Values: '%s'" %
+                        (importDatetimezoneStr, configFile.name, pytz.all_timezones))
+
+
+def validateData(config, inputFilename, dataType, strictMode):
+    # Iterate through records and look for common issues
+    inputFile = open(inputFilename, 'r', encoding='utf-8-sig')
+    csvReader = csv.DictReader(inputFile)
+    pxDatatypeMappings = loadFieldTypeMapping(dataType, config)
+    csvToPXFieldMap = config.get('fieldMapping').get(dataType)
+    csvToPXMapping = {csvField: pxField for (pxField, csvField) in csvToPXFieldMap.items()}
+
+    # Validate the columns in the CSV
+    ignoredCsvColumns = []
+    for (colIndex, colName) in enumerate(csvReader.fieldnames):
+        if colName not in csvToPXMapping:
+            # Column in CSV, but not in config, ignore
+            message = "Unmapped column %d in CSV: '%s'" % (colIndex, colName)
+            if strictMode:
+                raise Exception(message)
+            else:
+                print("Ignoring %s" % message)
+                ignoredCsvColumns.append(colName)
+
+    # Validate columns in mapping exist in CSV
+    for (pxField, csvField) in csvToPXFieldMap.items():
+        if csvField not in csvReader.fieldnames:
+            message = "'%s => %s' mapping found in config for field that does not exist in CSV" % (csvField, pxField)
+            if strictMode:
+                raise Exception(message)
+            else:
+                print("Ignoring %s" % message)
+                ignoredCsvColumns.append(csvField)
+                continue
+
+        # Make sure field exists in PX (if not a custom event attribute)
+        if not (dataType == CUSTOM_EVENT and pxField.startswith('attributes.')):
+            pxFieldShortName = getPXFieldName(pxField, dataType)
+            if pxFieldShortName not in pxDatatypeMappings:
+                raise Exception("Unknown field '%s' in '%s'" % (pxField, configFile.name))
+
+    # Validate the rows
+    importDatetimezone = getImportTimezone(config)
+    for (rowIndex, csvRow) in enumerate(csvReader):
+        for (pxField, csvField) in csvToPXFieldMap.items():
+            if not (csvField in ignoredCsvColumns or (dataType == CUSTOM_EVENT and pxField.startswith('attributes.'))):
+                validateColumnValue(csvRow[csvField], getPXFieldName(pxField, dataType), csvField, rowIndex, pxDatatypeMappings,
+                                    importDatetimezone, strictMode)
+
+
+def getImportTimezone(config):
+    importDatetimezoneStr = config.get('timezone', 'UTC')
+    return pytz.timezone(importDatetimezoneStr)
+
+
+def getPXFieldName(pxField, dataType):
+    # Strip off the customAttributes. prefix
+    pxFieldShortName = pxField if not pxField.startswith("customAttributes") else pxField[len("customAttributes."):]
+    pxFieldShortName = pxFieldShortName if not pxFieldShortName.startswith("location.") else pxFieldShortName[len("location."):]
+    if pxFieldShortName == INFO_BY_TYPE[dataType].get('keyField') and dataType != CUSTOM_EVENT:
+        # Special case for id's
+        pxFieldShortName = "id"
+    return pxFieldShortName
+
+
+def validateColumnValue(csvValue, pxField, csvField, rowIndex, pxDatatypeMappings, importDatetimezone, strictMode):
+    pxFieldType = pxDatatypeMappings.get(pxField).upper()
+    errorMessage = None
+
+    # special handling for id, must be non-null
+    if pxField == "id" and (csvValue is None or len(csvValue) == 0):
+        errorMessage = "Invalid value '%s' for %s row: %d" % (csvValue, csvField, rowIndex)
+    else:
+        if csvValue is None or len(csvValue) == 0:
+            return True
+
+        if pxFieldType == DATATYPE_DATE:
+            try:
+                # Try both ISO date and epoch milliseconds
+                importDatetimezone.localize(dparser.parse(csvValue, fuzzy=False))
+            except:
+                try:
+                    int(csvValue)
+                except:
+                    errorMessage = "Invalid date value '%s' for %s row: %d" % (csvValue, csvField, rowIndex)
+
+        elif pxFieldType == DATATYPE_NUMBER:
+            try:
+                ast.literal_eval(csvValue)
+            except:
+                errorMessage = "Invalid numeric value '%s' for %s row: %d" % (csvValue, csvField, rowIndex)
+        elif pxFieldType == DATATYPE_BOOLEAN:
+            try:
+                strtobool(str(csvValue))
+            except:
+                errorMessage = "Invalid boolean value '%s' for %s row: %d" % (csvValue, csvField, rowIndex)
+
+    if errorMessage is not None:
+        if strictMode:
+            raise Exception(errorMessage)
+        else:
+            print(errorMessage)
+
+
+def getHeaders(config):
+    headers = DEFAULT_HEADER.copy()
+    headers.update({'X-APTRINSIC-API-KEY': config.get('apiKey')})
+    return headers
+
+
+def loadData(config, inputFilename, startRow, lastRow, dataType, insertMissing, verbose, dryRun):
+    inputFile = open(inputFilename, 'r', encoding='utf-8-sig')
+    print("Loading %s data from '%s'" % (dataType, inputFilename))
+    errorfile = os.path.splitext(os.path.basename(inputFile.name))[0] + "_error.txt"
+    errorCounter = skippedCounter = updatedCounter = insertedCounter = 0
+    csvReader = csv.DictReader(inputFile)
+    keyField = INFO_BY_TYPE[dataType].get('keyField')
+    endpoint = getBaseURL(config)
+    endpointSuffix = INFO_BY_TYPE[dataType].get('endpoint')
+    endpoint = endpoint + "/" + endpointSuffix
+    if (startRow > 0):
+        print(("Skipping to row %d" % startRow), file=sys.stderr)
+
+    headers = getHeaders(config)
+    datatypeMapping = loadFieldTypeMapping(dataType, config)
+    # print("Data Type Mapping: " + str(datatypeMapping))
+    importDatetimezone = getImportTimezone(config)
+    for (rowIndex, csvRow) in enumerate(csvReader):
+        if rowIndex < startRow:
+            continue
+        if lastRow != 0 and rowIndex > lastRow:
+            print("Stopping after %d" % (lastRow))
+            break
+        updateData = mapRecord(csvRow, config.get('fieldMapping').get(dataType), dataType, datatypeMapping,
+                               importDatetimezone)
+        if verbose:
+            print(json.dumps(updateData))
+        if not updateData.get(keyField):
+            print("\nRow: %d Error Missing %s value: '%s'" % (rowIndex, keyField, updateData), file=sys.stderr)
+            break
+
+        uniqueId = updateData[keyField]
+        updateEndpoint = "%s/%s" % (endpoint, uniqueId)
+
+        if dataType.upper() == CUSTOM_EVENT:
+            updateData["userType"] = "USER"
+            updateData['propertyKey'] = config['productKey']
+            updateJson = json.dumps(updateData)
+            if dryRun:
+                print("DRYRUN: Request: '%s' Data: '%s'" % (endpoint, updateJson))
+            else:
+                response = requestsRetrySession().post(endpoint, headers=headers, data=updateJson)
+                if response.status_code != 201:
+                    print(("Error %d : '%s' on %s" % (response.status_code, response.text, updateJson)), file=sys.stderr)
+                    print(("Error CSV Row : %s" % (csvRow)), file=sys.stderr)
+                    errorCounter += 1
+                    writeToErrorFile(errorfile, csvRow, response.text)
+                    sys.stderr.flush()
+                else:
+                    if verbose:
+                        print("Inserted custom event %s" % (updateJson))
+                    insertedCounter += 1
+        else:
+            if dataType.upper() != USER_PREFERENCES:
+                # For user and account updates, add the product key to the payload
+                updateData['propertyKeys'] = config['productKey'] if isinstance(config['productKey'], list) else [
+                    config['productKey']]
+
+            updateJson = json.dumps(updateData)
+            if dryRun:
+                print("DRYRUN: Request: '%s' Data: '%s'" % (endpoint, updateJson))
+            else:
+                response = requestsRetrySession().put(updateEndpoint, headers=headers, data=updateJson)
+                if (response.status_code != 204):
+                    if (response.status_code == 404):
+                        if insertMissing:
+                            # Do insert since update failed
+                            insertData = updateData
+                            insertJson = json.dumps(insertData)
+                            insertResponse = requestsRetrySession().post(endpoint, headers=headers, data=insertJson)
+                            if (insertResponse.status_code != 201):
+                                print("\nRow: %d Error %d on insert : '%s' on %s" % (
+                                    rowIndex, insertResponse.status_code, insertResponse.text, insertJson), file=sys.stderr)
+                                errorCounter += 1
+                                writeToErrorFile(errorfile, csvRow, response.text)
+                            else:
+                                insertedCounter += 1
+                                if verbose:
+                                    print("Inserted record for '%s'" % (uniqueId))
+                        else:
+                            print("\nRow: %d Skipping update, no match found for %s==%s" % (rowIndex, keyField, uniqueId),
+                                  file=sys.stderr)
+                            skippedCounter += 1
+                    else:
+                        print("\nRow: %d Error %d : '%s' on %s" % (rowIndex, response.status_code, response.text, updateJson),
+                              file=sys.stderr)
+                        errorCounter += 1
+                        writeToErrorFile(errorfile, csvRow, response.text)
+                    sys.stderr.flush()
+                else:
+                    updatedCounter += 1
+                    if verbose:
+                        print("Updated record for '%s'" % (uniqueId))
+
+        sys.stdout.flush()
+
+    print("\nDONE%s: %d updated, %d inserted, %d skipped, %d errors" % (
+        (" (DRYRUN) " if dryRun else ""), updatedCounter, insertedCounter, skippedCounter, errorCounter))
+    return
+
+
+def mapRecord(csvRow, fieldMapping, dataType, datatypeMapping, importDatetimezone):
+    # Return an object built using data from csvRow with Aptrinsic field names from mapping data
+    record = {}
+    for mapping in fieldMapping.items():
+        aptrinsicFieldname = mapping[0]
+        sourceFieldname = mapping[1]
+        if sourceFieldname in csvRow:
+            fieldValue = csvRow[sourceFieldname]
+            apAPINamearr = aptrinsicFieldname.split(".")
+            apAPIName = apAPINamearr[len(apAPINamearr) - 1]
+            if apAPIName in INFO_BY_TYPE[dataType]["apiNameMapping"]:
+                apAPIName = INFO_BY_TYPE[dataType]["apiNameMapping"][apAPIName]
+            if fieldValue is not None and len(fieldValue) == 0 and aptrinsicFieldname in datatypeMapping:
+                continue
+            if apAPIName in datatypeMapping:
+                if datatypeMapping.get(apAPIName).upper() == DATATYPE_DATE:
+                    if fieldValue is None or len(fieldValue) == 0:
+                        # REST api can't handle empty/null dates, skip it
+                        continue
+                    try:
+                        dateValue = importDatetimezone.localize(dparser.parse(fieldValue, fuzzy=False))
+                        fieldValue = int((dateValue - EPOCH_START_TIME).total_seconds()) * 1000
+                    except:
+                        # Try converting it to an integer for epoch milliseconds
+                        try:
+                            fieldValue = int(fieldValue)
+                        except:
+                            # Anything other than int is skipped
+                            continue
+                elif datatypeMapping.get(apAPIName).upper() == DATATYPE_NUMBER:
+                    try:
+                        fieldValue = ast.literal_eval(fieldValue)
+                        if fieldValue in [float('inf'), float('-inf')]:
+                            # Can't handle Infinity in REST api
+                            continue
+                    except:
+                        # Don't want to try setting a bad value, skip it
+                        continue
+                elif datatypeMapping.get(apAPIName).upper() == DATATYPE_BOOLEAN:
+                    try:
+                        if strtobool(str(fieldValue)):
+                            fieldValue = "true"
+                        else:
+                            fieldValue = "false"
+                    except:
+                        fieldValue = "false"
+            if "." in aptrinsicFieldname:
+                # Field is nested in object
+                fieldNames = aptrinsicFieldname.split('.')
+                nestedObject = record.get(fieldNames[0], {})
+                record[fieldNames[0]] = nestedObject
+                for index, fieldName in enumerate(fieldNames[1:]):
+                    if index == len(fieldNames) - 2:
+                        nestedObject[fieldName] = fieldValue
+                    else:
+                        nestedObject[fieldName] = nestedObject.get(fieldName, {})
+                        nestedObject = nestedObject[fieldName]
+            else:
+                record[aptrinsicFieldname] = fieldValue
+
+    return record
+
+
+def requestsRetrySession(
+    retries=5,
+    backoff_factor=0.3,
+    status_forcelist=(429, 500, 502, 503, 504, 598, 599),
+    session=None,
+    allowed_methods=['HEAD', 'TRACE', 'GET', 'PUT', 'OPTIONS', 'DELETE', 'POST']
+):
+    session = session or requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        allowed_methods=allowed_methods,
+        raise_on_status=False
+    )
+    adapter = TimeoutHTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+
+class TimeoutHTTPAdapter(HTTPAdapter):
+    def __init__(self, *args, **kwargs):
+        self.timeout = DEFAULT_TIMEOUT
+        if "timeout" in kwargs:
+            self.timeout = kwargs["timeout"]
+            del kwargs["timeout"]
+        super(TimeoutHTTPAdapter, self).__init__(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            kwargs["timeout"] = self.timeout
+        return super(TimeoutHTTPAdapter, self).send(request, **kwargs)
+
+
+if __name__ == "__main__":
+    usage = """usage: %prog [options] config_file [USER|ACCOUNT|CUSTOM_EVENT|USER_PREFERENCES] input_file
+Example:
+    %prog config.json USER input.csv 2> errors.log | tee output.log
+
+Config File Example:
+    {
+      "apiKey" : "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
+      "productKey" : "AP-XXXXXXXXXXXX-2",
+      "dataCenter" : "US",
+      "timezone" : "America/Los_Angeles",
+      "fieldMapping" : {
+        "USER" : {
+          "identifyId" : "id",
+          "title" : "title",
+          "phone" : "telephone",
+          "location.city" : "city",
+          "location.stateCode" : "state",
+          "customAttributes.strtmp1" : "strtmp1"
+        },
+        "ACCOUNT" : {
+          "id" : "id",
+          "name" : "account_name"
+        },
+        "CUSTOM_EVENT" :{
+          "identifyId" : "User_Id",
+          "eventName" : "Event_Name",
+          "date" : "Time",
+          "url":"current_url",
+          "referrer":"referrer",
+          "remoteHost":"referring_domain",
+          "attributes.Organisation" : "Organisation",
+          "attributes.FromTo" : "FromTo"
+        },
+        "USER_PREFERENCES" :{
+          "identifyId" : "User_Id",
+          "trackUsage" : "track_usage",
+          "productUpdates" : "product_updates",
+          "guidedTours" : "guided_tours",
+          "surveys" : "surveys",
+          "onboardingBot" : "onboarding_bot"
+        }
+      }
+    } 
+"""
+
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option("-n", dest="startRow", type=int, default=0, help="Start at line number, Default: %default")
+    parser.add_option("-l", dest="lastRow", type=int, default=0, help="Stop at line number, Default: %default")
+    parser.add_option("-i", "--insertMissing", dest="insertMissing", action="store_true",
+                      default=False,
+                      help="If set, will insert user or account records that do not match to existing records. Not applicable for user preferences. Default: %default")
+    parser.add_option("-d", "--dryRun", dest="dryRun", action="store_true", default=False,
+                      help="If set, will not insert/update data Default: %default")
+    parser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,
+                      help="If set, enables verbose logging. Default: %default")
+    parser.add_option("-s", "--strict", dest="strict", action="store_true", default=False,
+                      help="If set, enables strict mode that fails on all mapping errors Default: %default")
+    (opts, args) = parser.parse_args()
+
+    if len(args) != 3:
+        print("Incorrect number of arguments: %d" % len(args), file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    configFilename = args[0]
+    dataType = args[1]
+    inputFilename = args[2]
+    startRow = opts.startRow
+    lastRow = opts.lastRow
+    insertMissing = opts.insertMissing
+    verbose = opts.verbose
+    dryRun = opts.dryRun
+    strictMode = opts.strict
+
+    if not os.path.isfile(configFilename):
+        print("ERROR: Unable to find configFile at '%s'" % (configFilename), file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    if not os.path.isfile(inputFilename):
+        print("ERROR: Unable to find inputFile at '%s'" % (inputFilename), file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    if dataType not in VALID_TYPES:
+        print("ERROR: Invalid data type: '%s', must be one of '%s'" % (dataType, VALID_TYPES), file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
+
+    if dataType in [USER_PREFERENCES, CUSTOM_EVENT] and insertMissing:
+        print("ERROR: --insertMissing flag invalid for %s" % (dataType))
+        parser.print_help()
+        sys.exit(1)
+
+    configFile = open(configFilename, 'r')
+
+    config = loadConfig(configFile)
+    try:
+        validateConfig(config, dataType, strictMode)
+    except Exception as e:
+        print("ERROR: %s" % (e), file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        validateData(config, inputFilename, dataType, strictMode)
+    except Exception as e:
+        print("Data Validation ERROR: %s" % (e), file=sys.stderr)
+        sys.exit(1)
+
+    loadData(config, inputFilename, startRow, lastRow, dataType, insertMissing, verbose, dryRun)

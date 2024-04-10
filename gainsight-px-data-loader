@@ -509,7 +509,7 @@ def mapRecord(csvRow, fieldMapping, dataType, datatypeMapping, importDatetimezon
                     except:
                         # Try converting it to an integer for epoch milliseconds
                         try:
-                            fieldValue = int(fieldValue)
+                            fieldValue = int(float(fieldValue))
                         except:
                             # Anything other than int is skipped
                             continue

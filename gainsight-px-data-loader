@@ -277,11 +277,10 @@ def validateConfig(config, dataType, strictMode):
                         (importDatetimezoneStr, configFile.name, pytz.all_timezones))
 
 
-def validateData(config, inputFilename, dataType, strictMode):
+def validateData(config, inputFilename, dataType, strictMode, pxDatatypeMappings):
     # Iterate through records and look for common issues
     inputFile = open(inputFilename, 'r', encoding='utf-8-sig')
     csvReader = csv.DictReader(inputFile)
-    pxDatatypeMappings = loadFieldTypeMapping(dataType, config)
     csvToPXFieldMap = config.get('fieldMapping').get(dataType)
     csvToPXMapping = {csvField: pxField for (pxField, csvField) in csvToPXFieldMap.items()}
 
@@ -383,7 +382,7 @@ def getHeaders(config):
     return headers
 
 
-def loadData(config, inputFilename, startRow, lastRow, dataType, insertMissing, verbose, dryRun):
+def loadData(config, inputFilename, startRow, lastRow, dataType, insertMissing, verbose, dryRun, datatypeMapping):
     inputFile = open(inputFilename, 'r', encoding='utf-8-sig')
     print("Loading %s data from '%s'" % (dataType, inputFilename))
     errorfile = os.path.splitext(os.path.basename(inputFile.name))[0] + "_error.txt"
@@ -397,7 +396,6 @@ def loadData(config, inputFilename, startRow, lastRow, dataType, insertMissing, 
         print(("Skipping to row %d" % startRow), file=sys.stderr)
 
     headers = getHeaders(config)
-    datatypeMapping = loadFieldTypeMapping(dataType, config)
     # print("Data Type Mapping: " + str(datatypeMapping))
     importDatetimezone = getImportTimezone(config)
     for (rowIndex, csvRow) in enumerate(csvReader):
@@ -685,14 +683,15 @@ Config File Example:
     config = loadConfig(configFile)
     try:
         validateConfig(config, dataType, strictMode)
+        pxDatatypeMappings = loadFieldTypeMapping(dataType, config)
     except Exception as e:
         print("ERROR: %s" % (e), file=sys.stderr)
         sys.exit(1)
 
     try:
-        validateData(config, inputFilename, dataType, strictMode)
+        validateData(config, inputFilename, dataType, strictMode, pxDatatypeMappings)
     except Exception as e:
         print("Data Validation ERROR: %s" % (e), file=sys.stderr)
         sys.exit(1)
 
-    loadData(config, inputFilename, startRow, lastRow, dataType, insertMissing, verbose, dryRun)
+    loadData(config, inputFilename, startRow, lastRow, dataType, insertMissing, verbose, dryRun, pxDatatypeMappings)

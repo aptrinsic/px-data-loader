@@ -1,0 +1,8 @@
+* @gs-gmichlin @gs-ecohen @gs-srpulagam @gs-rlam
+
+install.sh @aptrinsic/px-devops
+.github/workflows @aptrinsic/px-devops
+scripts @aptrinsic/px-devops
+CODEOWNERS @aptrinsic/px-devops
+**/Jenkinsfile @aptrinsic/px-devops
+**/Dockerfile @aptrinsic/px-devops
